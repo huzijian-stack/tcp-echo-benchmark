@@ -58,9 +58,6 @@ tcp-echo-benchmark/
 ├── super_client.py             # 服务器控制工具
 ├── benchmark.sh                # 性能对比脚本
 ├── setup_ebpf_env.sh           # eBPF 环境配置脚本
-├── QUICKSTART.md               # 快速开始指南
-├── EBPF_SETUP.md               # eBPF 配置文档
-└── EBPF_QUICK_SETUP.md         # eBPF 快速配置
 ```
 
 ## 🚀 快速开始
@@ -71,8 +68,6 @@ tcp-echo-benchmark/
 # 首次使用：自动配置开发环境
 ./setup_env.sh
 
-# 手动配置（可选）
-# 详见 EBPF_QUICK_SETUP.md
 ```
 
 ### 2. 编译项目
@@ -256,7 +251,6 @@ ls -lh test/logs/
 5. 验证环境并测试编译
 
 ### 手动配置
-详见 [EBPF_QUICK_SETUP.md](EBPF_QUICK_SETUP.md)
 
 核心步骤：
 1. 配置 clang-18 为默认版本
@@ -346,12 +340,6 @@ make tail-client
 - **SK_SKB Parser**：解析流数据边界
 - **SK_SKB Verdict**：决定数据包去向
 - **Sockmap/Sockhash**：存储 socket 映射
-
-## 📚 文档
-
-- [QUICKSTART.md](QUICKSTART.md) - 快速开始指南
-- [EBPF_SETUP.md](EBPF_SETUP.md) - eBPF 完整配置文档
-- [EBPF_QUICK_SETUP.md](EBPF_QUICK_SETUP.md) - eBPF 快速配置指南
 
 ## ⚠️ 注意事项
 
