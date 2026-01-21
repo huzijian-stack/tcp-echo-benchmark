@@ -26,10 +26,16 @@ echo "  数据包大小: $SIZE 字节"
 echo ""
 
 # 确保 server 没有运行
-pkill -f "./out/server" 2>/dev/null || true
-sudo pkill -f "./out/server_ebpf" 2>/dev/null || true
-sleep 1
+cleanup() {
+    # 1. 强杀进程
+    sudo pkill -9 -f "out/server" 2>/dev/null || true
+    sudo pkill -9 -f "out/client" 2>/dev/null || true
 
+    sudo rm -f /tmp/tcp_echo_server.sock
+
+    sleep 1
+}
+cleanup
 # ============================================
 # 测试 1: 基础版本（无 eBPF）
 # ============================================
@@ -48,6 +54,7 @@ kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 sleep 1
 
+cleanup
 # 提取性能数据（跳过日志时间戳，排除 PROGRESS）
 BASELINE_QPS=$(grep "QPS:" /tmp/baseline.txt | grep -v PROGRESS | awk '{print $5}')
 BASELINE_LATENCY=$(grep "平均延迟:" /tmp/baseline.txt | awk '{print $5}')

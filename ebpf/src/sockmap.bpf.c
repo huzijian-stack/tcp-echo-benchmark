@@ -25,6 +25,7 @@ static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *)2;
 static long (*bpf_msg_redirect_hash)(void *msg, void *map, void *key, __u64 flags) = (void *)71;
 static long (*bpf_sk_redirect_hash)(void *skb, void *map, void *key, __u64 flags) = (void *)72;
+static long (*bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *)6;
 
 /* BPF 程序返回值 */
 #define SK_PASS 1
@@ -34,6 +35,14 @@ static long (*bpf_sk_redirect_hash)(void *skb, void *map, void *key, __u64 flags
 /* Map 定义宏 */
 #define __uint(name, val) int(*name)[val]
 #define __type(name, val) typeof(val) *name
+
+#ifndef bpf_printk
+#define bpf_printk(fmt, ...)                                       \
+    ({                                                             \
+        char ____fmt[] = fmt;                                      \
+        bpf_trace_printk(____fmt, sizeof(____fmt), ##__VA_ARGS__); \
+    })
+#endif
 
 /* SK_MSG 上下文 */
 struct sk_msg_md {
@@ -161,17 +170,17 @@ int bpf_prog_parser(struct __sk_buff *skb) {
     return skb->len;
 }
 
-// SK_SKB 程序（Stream Verdict）：决定数据包的去向
 SEC("sk_skb/stream_verdict")
 int bpf_prog_verdict(struct __sk_buff *skb) {
     __u32 key;
     __u64 *val;
 
-    // 构造 hash key（对端标识）
-    __u64 hash_key = ((__u64)skb->remote_ip4 << 32) | skb->remote_port;
+    __u32 port_net = __builtin_bswap32(skb->remote_port);
 
-    // 尝试重定向到对端 socket
-    long ret = bpf_sk_redirect_hash(skb, &sock_hash, &hash_key, BPF_F_INGRESS);
+    __u64 hash_key = ((__u64)skb->remote_ip4 << 32) | port_net;
+
+    // 尝试重定向 (保持 flags=0)
+    long ret = bpf_sk_redirect_hash(skb, &sock_hash, &hash_key, 0);
 
     if (ret == SK_PASS) {
         key = STAT_REDIRECTED;
@@ -179,13 +188,15 @@ int bpf_prog_verdict(struct __sk_buff *skb) {
         if (val)
             __sync_fetch_and_add(val, 1);
         return SK_PASS;
-    } else {
-        key = STAT_REDIRECT_ERR;
-        val = bpf_map_lookup_elem(&stats, &key);
-        if (val)
-            __sync_fetch_and_add(val, 1);
-        return SK_PASS;  // 失败时走正常路径
     }
+
+    // 重定向失败
+    key = STAT_REDIRECT_ERR;
+    val = bpf_map_lookup_elem(&stats, &key);
+    if (val)
+        __sync_fetch_and_add(val, 1);
+
+    return SK_PASS;
 }
 
 char _license[] SEC("license") = "GPL";

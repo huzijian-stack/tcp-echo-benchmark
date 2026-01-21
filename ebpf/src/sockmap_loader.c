@@ -115,15 +115,6 @@ sockmap_loader_t *sockmap_loader_init(const char *bpf_obj_path) {
         return NULL;
     }
 
-    // 附加 msg 程序到 sockmap
-    err = bpf_prog_attach(loader->prog_msg_fd, loader->map_sock_fd, BPF_SK_MSG_VERDICT, 0);
-    if (err) {
-        fprintf(stderr, "Failed to attach msg program: %d\n", err);
-        bpf_object__close(obj);
-        free(loader);
-        return NULL;
-    }
-
     printf("eBPF Sockmap loaded successfully\n");
     printf("  - sockmap fd: %d\n", loader->map_sock_fd);
     printf("  - sockhash fd: %d\n", loader->map_hash_fd);
@@ -134,22 +125,16 @@ sockmap_loader_t *sockmap_loader_init(const char *bpf_obj_path) {
     return loader;
 }
 
-// 辅助函数：构造 sock_hash 的 key
-// 注意：BPF 上下文中 remote_ip4 是网络字节序，remote_port 通常是主机字节序
 static int get_socket_key(int fd, __u64 *key) {
     struct sockaddr_in addr;
     socklen_t len = sizeof(addr);
 
-    // 获取对端地址 (Remote IP/Port)
     if (getpeername(fd, (struct sockaddr *)&addr, &len) < 0) {
         return -1;
     }
 
-    // 构造 Key：高32位是 IP (Network Order)，低32位是 Port (Host Order)
-    // 这必须与 sockmap.bpf.c 中的 ((__u64)msg->remote_ip4 << 32) | msg->remote_port 保持一致
-    // 注意：sk_msg_md 中的 remote_port 通常是主机字节序
     __u32 ip = addr.sin_addr.s_addr;
-    __u32 port = ntohs(addr.sin_port);
+    __u32 port = htons(addr.sin_port);
 
     *key = ((__u64)ip << 32) | port;
     return 0;
@@ -161,8 +146,7 @@ int sockmap_loader_add_socket(sockmap_loader_t *loader, int sock_fd) {
     int err;
 
     // 1. 添加到 sock_map (Array)
-    // 这一步主要用于将 BPF 程序 (Parser/Verdict) 附加到 Socket 上
-    __u32 idx = sock_fd;  // 使用 fd 作为数组索引
+    __u32 idx = sock_fd;
     err = bpf_map_update_elem(loader->map_sock_fd, &idx, &sock_fd, BPF_ANY);
     if (err) {
         fprintf(stderr, "Failed to add socket %d to sock_map: %d\n", sock_fd, err);
@@ -170,13 +154,11 @@ int sockmap_loader_add_socket(sockmap_loader_t *loader, int sock_fd) {
     }
 
     // 2. 添加到 sock_hash (Hash)
-    // 这一步用于 BPF 程序中的 redirect 查找
     __u64 key;
     if (get_socket_key(sock_fd, &key) == 0) {
         err = bpf_map_update_elem(loader->map_hash_fd, &key, &sock_fd, BPF_ANY);
         if (err) {
             fprintf(stderr, "Failed to add socket %d to sock_hash: %d\n", sock_fd, err);
-            // 不返回失败，因为 sock_map 已经成功，至少 parser 会工作
         }
     } else {
         fprintf(stderr, "Failed to get peer name for socket %d\n", sock_fd);
