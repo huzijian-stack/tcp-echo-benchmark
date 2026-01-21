@@ -9,6 +9,15 @@
 *.a
 *.bpf.o
 
+# libbpf 编译产物（但保留 submodule 目录结构）
+third_party/libbpf/src/*.o
+third_party/libbpf/src/*.a
+third_party/libbpf/src/*.so
+third_party/libbpf/src/*.so.*
+third_party/libbpf/src/*.pc
+third_party/libbpf/src/staticobjs/
+third_party/libbpf/src/sharedobjs/
+
 # 测试日志和临时文件
 /test/logs/
 /test/

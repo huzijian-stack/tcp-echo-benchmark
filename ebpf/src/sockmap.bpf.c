@@ -21,10 +21,10 @@ enum bpf_map_type {
 };
 
 /* BPF 辅助函数声明 */
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
-static long (*bpf_msg_redirect_hash)(void *msg, void *map, void *key, __u64 flags) = (void *) 71;
-static long (*bpf_sk_redirect_hash)(void *skb, void *map, void *key, __u64 flags) = (void *) 72;
+static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
+static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *)2;
+static long (*bpf_msg_redirect_hash)(void *msg, void *map, void *key, __u64 flags) = (void *)71;
+static long (*bpf_sk_redirect_hash)(void *skb, void *map, void *key, __u64 flags) = (void *)72;
 
 /* BPF 程序返回值 */
 #define SK_PASS 1
@@ -32,7 +32,7 @@ static long (*bpf_sk_redirect_hash)(void *skb, void *map, void *key, __u64 flags
 #define BPF_ANY 0
 
 /* Map 定义宏 */
-#define __uint(name, val) int (*name)[val]
+#define __uint(name, val) int(*name)[val]
 #define __type(name, val) typeof(val) *name
 
 /* SK_MSG 上下文 */
@@ -86,7 +86,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_SOCKMAP);
     __uint(max_entries, 65536);
     __type(key, __u32);
-    __type(value, __u64);
+    __type(value, __u32);
 } sock_map SEC(".maps");
 
 // Socket Hash：用于快速查找对端 socket
@@ -94,7 +94,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_SOCKHASH);
     __uint(max_entries, 65536);
     __type(key, __u64);
-    __type(value, __u64);
+    __type(value, __u32);
 } sock_hash SEC(".maps");
 
 // 统计信息
@@ -106,15 +106,14 @@ struct {
 } stats SEC(".maps");
 
 // 统计索引
-#define STAT_REDIRECTED   0  // 重定向成功次数
+#define STAT_REDIRECTED 0    // 重定向成功次数
 #define STAT_REDIRECT_ERR 1  // 重定向失败次数
-#define STAT_PARSED       2  // 解析成功次数
-#define STAT_PARSE_ERR    3  // 解析失败次数
+#define STAT_PARSED 2        // 解析成功次数
+#define STAT_PARSE_ERR 3     // 解析失败次数
 
 // SK_MSG 程序：处理发送路径，实现 socket 间的直接数据转发
 SEC("sk_msg")
-int bpf_prog_msg(struct sk_msg_md *msg)
-{
+int bpf_prog_msg(struct sk_msg_md *msg) {
     __u32 key = STAT_PARSED;
     __u64 *val;
 
@@ -149,8 +148,7 @@ int bpf_prog_msg(struct sk_msg_md *msg)
 
 // SK_SKB 程序（Stream Parser）：解析流，决定消息边界
 SEC("sk_skb/stream_parser")
-int bpf_prog_parser(struct __sk_buff *skb)
-{
+int bpf_prog_parser(struct __sk_buff *skb) {
     __u32 key = STAT_PARSED;
     __u64 *val;
 
@@ -165,8 +163,7 @@ int bpf_prog_parser(struct __sk_buff *skb)
 
 // SK_SKB 程序（Stream Verdict）：决定数据包的去向
 SEC("sk_skb/stream_verdict")
-int bpf_prog_verdict(struct __sk_buff *skb)
-{
+int bpf_prog_verdict(struct __sk_buff *skb) {
     __u32 key;
     __u64 *val;
 

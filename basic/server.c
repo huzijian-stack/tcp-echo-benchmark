@@ -23,10 +23,10 @@
 #include "sockmap_loader.h"
 #endif
 
-#define PORT 8888                  // 监听端口
-#define MAX_EVENTS 1024            // epoll 最大事件数
-#define BUFFER_SIZE 4096           // 缓冲区大小
-#define BACKLOG 512                // listen 队列长度
+#define PORT 8888                                   // 监听端口
+#define MAX_EVENTS 1024                             // epoll 最大事件数
+#define BUFFER_SIZE 4096                            // 缓冲区大小
+#define BACKLOG 512                                 // listen 队列长度
 #define CONTROL_SOCKET "/tmp/tcp_echo_server.sock"  // 控制 socket 路径
 
 // 全局变量
@@ -123,7 +123,7 @@ int create_and_bind() {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(PORT);
 
-    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         LOG_ERROR(g_logger, "bind 失败: %s", strerror(errno));
         close(listen_fd);
         return -1;
@@ -138,7 +138,7 @@ int handle_accept(int listen_fd, int epoll_fd) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
-        int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -182,8 +182,8 @@ int handle_accept(int listen_fd, int epoll_fd) {
         }
 #endif
 
-        LOG_DEBUG(g_logger, "接受新连接：fd=%d (总连接=%lld, 活跃=%lld)",
-                 client_fd, g_stats.total_connections, g_stats.active_connections);
+        LOG_DEBUG(g_logger, "接受新连接：fd=%d (总连接=%lld, 活跃=%lld)", client_fd, g_stats.total_connections,
+                  g_stats.active_connections);
     }
     return 0;
 }
@@ -245,7 +245,7 @@ int handle_read(int client_fd) {
 }
 
 // 控制接口处理函数
-void* control_thread(void *arg) {
+void *control_thread(void *arg) {
     (void)arg;
 
     // 删除旧的 socket 文件
@@ -262,7 +262,7 @@ void* control_thread(void *arg) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, CONTROL_SOCKET, sizeof(addr.sun_path) - 1);
 
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         LOG_ERROR(g_logger, "控制 socket bind 失败: %s", strerror(errno));
         close(sock);
         return NULL;
@@ -279,7 +279,8 @@ void* control_thread(void *arg) {
     while (running) {
         int client = accept(sock, NULL, NULL);
         if (client < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             break;
         }
 
@@ -322,10 +323,9 @@ void* control_thread(void *arg) {
                      "    \"threads\": %ld\n"
                      "  }\n"
                      "}\n",
-                     uptime_sec,
-                     g_stats.total_connections, g_stats.active_connections,
-                     g_stats.total_requests, g_stats.total_bytes_recv, g_stats.total_bytes_sent,
-                     sys_stats.cpu_usage_percent, sys_stats.memory_rss_kb / 1024.0, sys_stats.num_threads);
+                     uptime_sec, g_stats.total_connections, g_stats.active_connections, g_stats.total_requests,
+                     g_stats.total_bytes_recv, g_stats.total_bytes_sent, sys_stats.cpu_usage_percent,
+                     sys_stats.memory_rss_kb / 1024.0, sys_stats.num_threads);
         } else if (strcmp(cmd, "shutdown") == 0) {
             snprintf(response, sizeof(response), "{\"status\": \"shutting_down\"}\n");
             write(client, response, strlen(response));
@@ -350,10 +350,9 @@ int main() {
     char log_filename[256];
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    snprintf(log_filename, sizeof(log_filename),
-             "test/logs/server_%04d%02d%02d_%02d%02d%02d.log",
-             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    snprintf(log_filename, sizeof(log_filename), "test/logs/server_%04d%02d%02d_%02d%02d%02d.log",
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday, tm_info->tm_hour, tm_info->tm_min,
+             tm_info->tm_sec);
 
     g_logger = logger_init(log_filename, LOG_INFO, 1, "server");
     if (!g_logger) {
@@ -473,8 +472,7 @@ int main() {
                     LOG_ERROR(g_logger, "accept 失败");
                 }
             } else {
-                if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) ||
-                    (!(events[i].events & EPOLLIN))) {
+                if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN))) {
                     close(events[i].data.fd);
                     g_stats.active_connections--;
                     continue;

@@ -6,21 +6,23 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "sockmap_loader.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 struct sockmap_loader {
     struct bpf_object *obj;
     struct bpf_program *prog_msg;
     struct bpf_program *prog_parser;
     struct bpf_program *prog_verdict;
-    int map_sock_fd;     // sockmap fd
-    int map_hash_fd;     // sockhash fd
-    int map_stats_fd;    // stats fd
+    int map_sock_fd;   // sockmap fd
+    int map_hash_fd;   // sockhash fd
+    int map_stats_fd;  // stats fd
     int prog_msg_fd;
     int prog_parser_fd;
     int prog_verdict_fd;
 };
 
-sockmap_loader_t* sockmap_loader_init(const char *bpf_obj_path) {
+sockmap_loader_t *sockmap_loader_init(const char *bpf_obj_path) {
     struct bpf_object *obj;
     int err;
 
@@ -97,8 +99,7 @@ sockmap_loader_t* sockmap_loader_init(const char *bpf_obj_path) {
     loader->map_stats_fd = bpf_map__fd(map);
 
     // 附加 parser 和 verdict 程序到 sockmap
-    err = bpf_prog_attach(loader->prog_parser_fd, loader->map_sock_fd,
-                          BPF_SK_SKB_STREAM_PARSER, 0);
+    err = bpf_prog_attach(loader->prog_parser_fd, loader->map_sock_fd, BPF_SK_SKB_STREAM_PARSER, 0);
     if (err) {
         fprintf(stderr, "Failed to attach parser program: %d\n", err);
         bpf_object__close(obj);
@@ -106,8 +107,7 @@ sockmap_loader_t* sockmap_loader_init(const char *bpf_obj_path) {
         return NULL;
     }
 
-    err = bpf_prog_attach(loader->prog_verdict_fd, loader->map_sock_fd,
-                          BPF_SK_SKB_STREAM_VERDICT, 0);
+    err = bpf_prog_attach(loader->prog_verdict_fd, loader->map_sock_fd, BPF_SK_SKB_STREAM_VERDICT, 0);
     if (err) {
         fprintf(stderr, "Failed to attach verdict program: %d\n", err);
         bpf_object__close(obj);
@@ -116,8 +116,7 @@ sockmap_loader_t* sockmap_loader_init(const char *bpf_obj_path) {
     }
 
     // 附加 msg 程序到 sockmap
-    err = bpf_prog_attach(loader->prog_msg_fd, loader->map_sock_fd,
-                          BPF_SK_MSG_VERDICT, 0);
+    err = bpf_prog_attach(loader->prog_msg_fd, loader->map_sock_fd, BPF_SK_MSG_VERDICT, 0);
     if (err) {
         fprintf(stderr, "Failed to attach msg program: %d\n", err);
         bpf_object__close(obj);
@@ -135,43 +134,76 @@ sockmap_loader_t* sockmap_loader_init(const char *bpf_obj_path) {
     return loader;
 }
 
-int sockmap_loader_add_socket(sockmap_loader_t *loader, int sock_fd) {
-    if (!loader) {
+// 辅助函数：构造 sock_hash 的 key
+// 注意：BPF 上下文中 remote_ip4 是网络字节序，remote_port 通常是主机字节序
+static int get_socket_key(int fd, __u64 *key) {
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+
+    // 获取对端地址 (Remote IP/Port)
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) < 0) {
         return -1;
     }
 
-    // 将 socket 添加到 sockmap（使用 fd 作为 key）
-    __u32 key = sock_fd;
-    int err = bpf_map_update_elem(loader->map_sock_fd, &key, &sock_fd, BPF_ANY);
-    if (err) {
-        fprintf(stderr, "Failed to add socket %d to sockmap: %d\n", sock_fd, err);
+    // 构造 Key：高32位是 IP (Network Order)，低32位是 Port (Host Order)
+    // 这必须与 sockmap.bpf.c 中的 ((__u64)msg->remote_ip4 << 32) | msg->remote_port 保持一致
+    // 注意：sk_msg_md 中的 remote_port 通常是主机字节序
+    __u32 ip = addr.sin_addr.s_addr;
+    __u32 port = ntohs(addr.sin_port);
+
+    *key = ((__u64)ip << 32) | port;
+    return 0;
+}
+
+int sockmap_loader_add_socket(sockmap_loader_t *loader, int sock_fd) {
+    if (!loader)
         return -1;
+    int err;
+
+    // 1. 添加到 sock_map (Array)
+    // 这一步主要用于将 BPF 程序 (Parser/Verdict) 附加到 Socket 上
+    __u32 idx = sock_fd;  // 使用 fd 作为数组索引
+    err = bpf_map_update_elem(loader->map_sock_fd, &idx, &sock_fd, BPF_ANY);
+    if (err) {
+        fprintf(stderr, "Failed to add socket %d to sock_map: %d\n", sock_fd, err);
+        return -1;
+    }
+
+    // 2. 添加到 sock_hash (Hash)
+    // 这一步用于 BPF 程序中的 redirect 查找
+    __u64 key;
+    if (get_socket_key(sock_fd, &key) == 0) {
+        err = bpf_map_update_elem(loader->map_hash_fd, &key, &sock_fd, BPF_ANY);
+        if (err) {
+            fprintf(stderr, "Failed to add socket %d to sock_hash: %d\n", sock_fd, err);
+            // 不返回失败，因为 sock_map 已经成功，至少 parser 会工作
+        }
+    } else {
+        fprintf(stderr, "Failed to get peer name for socket %d\n", sock_fd);
     }
 
     return 0;
 }
 
 int sockmap_loader_remove_socket(sockmap_loader_t *loader, int sock_fd) {
-    if (!loader) {
+    if (!loader)
         return -1;
-    }
 
-    // 从 sockmap 移除 socket
-    __u32 key = sock_fd;
-    int err = bpf_map_delete_elem(loader->map_sock_fd, &key);
-    if (err) {
-        fprintf(stderr, "Failed to remove socket %d from sockmap: %d\n", sock_fd, err);
-        return -1;
+    // 1. 从 sock_map 移除
+    __u32 idx = sock_fd;
+    bpf_map_delete_elem(loader->map_sock_fd, &idx);
+
+    // 2. 从 sock_hash 移除
+    __u64 key;
+    if (get_socket_key(sock_fd, &key) == 0) {
+        bpf_map_delete_elem(loader->map_hash_fd, &key);
     }
 
     return 0;
 }
 
-int sockmap_loader_get_stats(sockmap_loader_t *loader,
-                             unsigned long long *redirected,
-                             unsigned long long *redirect_err,
-                             unsigned long long *parsed,
-                             unsigned long long *parse_err) {
+int sockmap_loader_get_stats(sockmap_loader_t *loader, unsigned long long *redirected, unsigned long long *redirect_err,
+                             unsigned long long *parsed, unsigned long long *parse_err) {
     if (!loader) {
         return -1;
     }
@@ -182,25 +214,29 @@ int sockmap_loader_get_stats(sockmap_loader_t *loader,
     // 读取重定向成功次数
     key = 0;  // STAT_REDIRECTED
     if (bpf_map_lookup_elem(loader->map_stats_fd, &key, &val) == 0) {
-        if (redirected) *redirected = val;
+        if (redirected)
+            *redirected = val;
     }
 
     // 读取重定向失败次数
     key = 1;  // STAT_REDIRECT_ERR
     if (bpf_map_lookup_elem(loader->map_stats_fd, &key, &val) == 0) {
-        if (redirect_err) *redirect_err = val;
+        if (redirect_err)
+            *redirect_err = val;
     }
 
     // 读取解析成功次数
     key = 2;  // STAT_PARSED
     if (bpf_map_lookup_elem(loader->map_stats_fd, &key, &val) == 0) {
-        if (parsed) *parsed = val;
+        if (parsed)
+            *parsed = val;
     }
 
     // 读取解析失败次数
     key = 3;  // STAT_PARSE_ERR
     if (bpf_map_lookup_elem(loader->map_stats_fd, &key, &val) == 0) {
-        if (parse_err) *parse_err = val;
+        if (parse_err)
+            *parse_err = val;
     }
 
     return 0;

@@ -12,6 +12,12 @@ LDFLAGS := -lpthread
 KERNEL_VERSION := $(shell uname -r)
 KERNEL_HEADERS := /usr/src/linux-headers-$(KERNEL_VERSION)
 
+# libbpf submodule 路径
+LIBBPF_DIR := third_party/libbpf
+LIBBPF_SRC := $(LIBBPF_DIR)/src
+LIBBPF_OBJ := $(LIBBPF_SRC)/libbpf.a
+LIBBPF_INCLUDES := -I$(LIBBPF_SRC)
+
 # BPF 编译选项（添加必要的 include 路径）
 BPF_CFLAGS := -O2 -target bpf -D__TARGET_ARCH_x86 -g \
 	-I$(KERNEL_HEADERS)/include \
@@ -49,7 +55,7 @@ CLIENT_SRC := $(SRC_DIR)/client.c
 COMMON_SRCS := $(COMMON_SRC)/logger.c $(COMMON_SRC)/monitor.c
 
 # 包含路径
-INCLUDE_DIRS := -I$(COMMON_INC) -I$(EBPF_INC)
+INCLUDE_DIRS := -I$(COMMON_INC) -I$(EBPF_INC) $(LIBBPF_INCLUDES)
 
 # 生成带时间戳的日志文件名
 TIMESTAMP := $(shell date +%Y%m%d_%H%M%S)
@@ -70,7 +76,7 @@ all: banner dirs $(SERVER_BIN) $(CLIENT_BIN) success
 
 # eBPF 版本（可选）
 .PHONY: all-ebpf
-all-ebpf: banner dirs $(SERVER_BIN) $(CLIENT_BIN) $(EBPF_OBJ) $(SERVER_EBPF_BIN) success-ebpf
+all-ebpf: banner dirs $(LIBBPF_OBJ) $(SERVER_BIN) $(CLIENT_BIN) $(EBPF_OBJ) $(SERVER_EBPF_BIN) success-ebpf
 
 # ============================================
 # 创建必要的目录
@@ -87,6 +93,17 @@ dirs:
 # 编译目标
 # ============================================
 
+# 编译 libbpf（从 submodule）
+$(LIBBPF_OBJ): .gitmodules
+	@echo "$(COLOR_YELLOW)[→] 检查 libbpf submodule...$(COLOR_RESET)"
+	@if [ ! -d "$(LIBBPF_DIR)/.git" ]; then \
+		echo "$(COLOR_YELLOW)[→] 初始化 libbpf submodule...$(COLOR_RESET)"; \
+		git submodule update --init --recursive; \
+	fi
+	@echo "$(COLOR_YELLOW)[→] 编译 libbpf...$(COLOR_RESET)"
+	@$(MAKE) -C $(LIBBPF_SRC) > /dev/null 2>&1
+	@echo "$(COLOR_GREEN)[✓] libbpf 编译完成: $@$(COLOR_RESET)"
+
 # 编译 eBPF 程序
 $(EBPF_OBJ): $(EBPF_SRC)/sockmap.bpf.c
 	@echo "$(COLOR_YELLOW)[→] 编译 eBPF 程序...$(COLOR_RESET)"
@@ -99,11 +116,11 @@ $(SERVER_BIN): $(SERVER_SRC) $(COMMON_SRCS)
 	@$(CC) $(CFLAGS) $(INCLUDE_DIRS) -o $@ $^ $(LDFLAGS)
 	@echo "$(COLOR_GREEN)[✓] Server 编译完成: $@$(COLOR_RESET)"
 
-# 编译 server (eBPF 版本)
-$(SERVER_EBPF_BIN): $(SERVER_SRC) $(COMMON_SRCS) $(SOCKMAP_LOADER_SRC)
+# 编译 server (eBPF 版本) - 使用 submodule 中的 libbpf
+$(SERVER_EBPF_BIN): $(SERVER_SRC) $(COMMON_SRCS) $(SOCKMAP_LOADER_SRC) $(LIBBPF_OBJ)
 	@echo "$(COLOR_YELLOW)[→] 编译 Server (eBPF 版本)...$(COLOR_RESET)"
-	@$(CC) $(CFLAGS) $(INCLUDE_DIRS) -DENABLE_EBPF -o $@ $^ $(LDFLAGS) -lbpf -lelf -lz
-	@echo "$(COLOR_GREEN)[✓] Server (eBPF) 编译完成: $@$(COLOR_RESET)"
+	@$(CC) $(CFLAGS) $(INCLUDE_DIRS) -DENABLE_EBPF -o $@ $(SERVER_SRC) $(COMMON_SRCS) $(SOCKMAP_LOADER_SRC) $(LDFLAGS) $(LIBBPF_OBJ) -lelf -lz
+	@echo "$(COLOR_GREEN)[✓] Server (eBPF) 编译完成 (使用 submodule libbpf): $@$(COLOR_RESET)"
 
 # 编译 client
 $(CLIENT_BIN): $(CLIENT_SRC) $(COMMON_SRCS)
@@ -121,9 +138,16 @@ clean:
 	@rm -f $(SRC_DIR)/server $(SRC_DIR)/client  # 清理旧的编译产物
 	@echo "$(COLOR_GREEN)[✓] 清理完成$(COLOR_RESET)"
 
-# 深度清理（包括日志）
+# 清理 libbpf
+.PHONY: clean-libbpf
+clean-libbpf:
+	@echo "$(COLOR_YELLOW)[→] 清理 libbpf...$(COLOR_RESET)"
+	@if [ -d "$(LIBBPF_SRC)" ]; then $(MAKE) -C $(LIBBPF_SRC) clean > /dev/null 2>&1; fi
+	@echo "$(COLOR_GREEN)[✓] libbpf 清理完成$(COLOR_RESET)"
+
+# 深度清理（包括日志和 libbpf）
 .PHONY: distclean
-distclean: clean
+distclean: clean clean-libbpf
 	@echo "$(COLOR_YELLOW)[→] 清理测试数据...$(COLOR_RESET)"
 	@rm -rf $(TEST_DIR)
 	@echo "$(COLOR_GREEN)[✓] 深度清理完成$(COLOR_RESET)"
@@ -156,6 +180,13 @@ stop-server:
 .PHONY: server-stop
 server-stop:
 	@python3 super_client.py stop
+
+# 停止 eBPF server（需要 root 权限）
+.PHONY: stop-server-ebpf
+stop-server-ebpf:
+	@echo "$(COLOR_YELLOW)[→] 停止 eBPF Server...$(COLOR_RESET)"
+	@sudo pkill -9 server_ebpf || echo "$(COLOR_YELLOW)没有运行中的 eBPF Server$(COLOR_RESET)"
+	@echo "$(COLOR_GREEN)[✓] eBPF Server 已停止$(COLOR_RESET)"
 
 # 查看 server 状态
 .PHONY: server-status
@@ -195,6 +226,44 @@ test: all
 	@$(MAKE) stop-server
 	@echo ""
 	@echo "$(COLOR_GREEN)[✓] 测试完成！查看日志: $(LOG_DIR)/$(COLOR_RESET)"
+
+# eBPF 版本测试流程（需要 root 权限）
+.PHONY: test-ebpf
+test-ebpf: all-ebpf
+	@echo ""
+	@echo "$(COLOR_BLUE)========================================$(COLOR_RESET)"
+	@echo "$(COLOR_BLUE)       开始 eBPF 版本基准测试$(COLOR_RESET)"
+	@echo "$(COLOR_BLUE)========================================$(COLOR_RESET)"
+	@echo ""
+	@echo "$(COLOR_YELLOW)[!] 注意: eBPF 测试需要 root 权限$(COLOR_RESET)"
+	@echo "$(COLOR_YELLOW)[!] 请使用: sudo make test-ebpf$(COLOR_RESET)"
+	@echo ""
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "$(COLOR_RED)[✗] 错误: 需要 root 权限运行此目标$(COLOR_RESET)"; \
+		echo "$(COLOR_YELLOW)    请使用: sudo make test-ebpf$(COLOR_RESET)"; \
+		exit 1; \
+	fi
+	@pkill -f "$(SERVER_EBPF_BIN)" 2>/dev/null || true
+	@sleep 1
+	@echo "$(COLOR_YELLOW)[→] 启动 eBPF Server...$(COLOR_RESET)"
+	@$(SERVER_EBPF_BIN) > $(LOG_DIR)/server_ebpf_$(TIMESTAMP).log 2>&1 &
+	@sleep 2
+	@echo "$(COLOR_YELLOW)[→] 运行 Client...$(COLOR_RESET)"
+	@$(CLIENT_BIN) 2>&1 | tee $(LOG_DIR)/client_ebpf_$(TIMESTAMP).log
+	@echo ""
+	@pkill -f "$(SERVER_EBPF_BIN)" 2>/dev/null || true
+	@echo ""
+	@echo "$(COLOR_GREEN)[✓] eBPF 测试完成！查看日志: $(LOG_DIR)/$(COLOR_RESET)"
+
+# 性能对比测试（使用 benchmark.sh）
+.PHONY: benchmark
+benchmark: all-ebpf
+	@echo ""
+	@echo "$(COLOR_BLUE)========================================$(COLOR_RESET)"
+	@echo "$(COLOR_BLUE)         性能对比测试$(COLOR_RESET)"
+	@echo "$(COLOR_BLUE)========================================$(COLOR_RESET)"
+	@echo ""
+	@./benchmark.sh
 
 # ============================================
 # 查看日志
@@ -275,15 +344,20 @@ help:
 	@echo "$(COLOR_BLUE)========================================$(COLOR_RESET)"
 	@echo ""
 	@echo "$(COLOR_GREEN)编译目标:$(COLOR_RESET)"
-	@echo "  make              - 编译所有程序"
+	@echo "  make              - 编译所有程序（基础版本）"
+	@echo "  make all-ebpf     - 编译所有程序（含 eBPF 版本）"
 	@echo "  make clean        - 清理编译产物"
 	@echo "  make distclean    - 清理编译产物和日志"
+	@echo ""
+	@echo "$(COLOR_GREEN)测试目标:$(COLOR_RESET)"
+	@echo "  make test         - 测试基础版本（编译→启动→测试→停止）"
+	@echo "  make test-ebpf    - 测试 eBPF 版本（需要 root 权限）"
+	@echo "  make benchmark    - 性能对比测试（基础 vs eBPF）"
 	@echo ""
 	@echo "$(COLOR_GREEN)运行目标:$(COLOR_RESET)"
 	@echo "  make run-server     - 启动 Server（后台运行，传统方式）"
 	@echo "  make run-client     - 运行 Client（前台运行）"
 	@echo "  make stop-server    - 停止 Server（传统方式）"
-	@echo "  make test           - 完整测试流程（编译→启动→测试→停止）"
 	@echo ""
 	@echo "$(COLOR_GREEN)Super Client 控制（推荐）:$(COLOR_RESET)"
 	@echo "  make server-start   - 启动 Server（使用 super_client）"
@@ -291,6 +365,9 @@ help:
 	@echo "  make server-status  - 查看 Server 状态"
 	@echo "  make server-stats   - 获取 Server 统计信息"
 	@echo "  make server-watch   - 实时监控 Server"
+	@echo ""
+	@echo "$(COLOR_GREEN)eBPF Server 控制:$(COLOR_RESET)"
+	@echo "  sudo make stop-server-ebpf  - 停止 eBPF Server（需要 root）"
 	@echo ""
 	@echo "$(COLOR_GREEN)日志目标:$(COLOR_RESET)"
 	@echo "  make logs         - 查看最近的测试日志"

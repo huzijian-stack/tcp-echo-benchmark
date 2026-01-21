@@ -55,9 +55,9 @@ void print_usage(const char *prog) {
 }
 
 struct connection {
-    int fd;              // socket 文件描述符
-    char *send_buf;      // 发送缓冲区（动态分配）
-    char *recv_buf;      // 接收缓冲区（动态分配）
+    int fd;          // socket 文件描述符
+    char *send_buf;  // 发送缓冲区（动态分配）
+    char *recv_buf;  // 接收缓冲区（动态分配）
 };
 
 // 设置 TCP_NODELAY（禁用 Nagle 算法，减少延迟）
@@ -148,7 +148,7 @@ int connect_to_server() {
     }
 
     // 3. 连接到服务器
-    if (connect(fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    if (connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         if (g_logger) {
             LOG_ERROR(g_logger, "connect 失败: %s", strerror(errno));
         }
@@ -169,68 +169,64 @@ int main(int argc, char *argv[]) {
     // ========================================
     // 1. 解析命令行参数
     // ========================================
-    ClientConfig config = {
-        .num_connections = DEFAULT_CONNECTIONS,
-        .test_rounds = DEFAULT_ROUNDS,
-        .send_size = DEFAULT_SIZE,
-        .qps_limit = DEFAULT_QPS,
-        .duration_sec = DEFAULT_DURATION
-    };
+    ClientConfig config = {.num_connections = DEFAULT_CONNECTIONS,
+                           .test_rounds = DEFAULT_ROUNDS,
+                           .send_size = DEFAULT_SIZE,
+                           .qps_limit = DEFAULT_QPS,
+                           .duration_sec = DEFAULT_DURATION};
 
-    static struct option long_options[] = {
-        {"connections", required_argument, 0, 'c'},
-        {"rounds",      required_argument, 0, 'r'},
-        {"size",        required_argument, 0, 's'},
-        {"qps",         required_argument, 0, 'q'},
-        {"duration",    required_argument, 0, 'd'},
-        {"help",        no_argument,       0, 'h'},
-        {0, 0, 0, 0}
-    };
+    static struct option long_options[] = {{"connections", required_argument, 0, 'c'},
+                                           {"rounds", required_argument, 0, 'r'},
+                                           {"size", required_argument, 0, 's'},
+                                           {"qps", required_argument, 0, 'q'},
+                                           {"duration", required_argument, 0, 'd'},
+                                           {"help", no_argument, 0, 'h'},
+                                           {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "c:r:s:q:d:h", long_options, NULL)) != -1) {
         switch (opt) {
-            case 'c':
-                config.num_connections = atoi(optarg);
-                if (config.num_connections <= 0 || config.num_connections > 10000) {
-                    fprintf(stderr, "错误: 连接数必须在 1-10000 之间\n");
-                    return 1;
-                }
-                break;
-            case 'r':
-                config.test_rounds = atoi(optarg);
-                if (config.test_rounds < 0) {
-                    fprintf(stderr, "错误: 轮次必须 >= 0\n");
-                    return 1;
-                }
-                break;
-            case 's':
-                config.send_size = atoi(optarg);
-                if (config.send_size <= 0 || config.send_size > 65536) {
-                    fprintf(stderr, "错误: 数据大小必须在 1-65536 字节之间\n");
-                    return 1;
-                }
-                break;
-            case 'q':
-                config.qps_limit = atoi(optarg);
-                if (config.qps_limit < 0) {
-                    fprintf(stderr, "错误: QPS 限制必须 >= 0\n");
-                    return 1;
-                }
-                break;
-            case 'd':
-                config.duration_sec = atoi(optarg);
-                if (config.duration_sec < 0) {
-                    fprintf(stderr, "错误: 时长必须 >= 0\n");
-                    return 1;
-                }
-                break;
-            case 'h':
-                print_usage(argv[0]);
-                return 0;
-            default:
-                print_usage(argv[0]);
+        case 'c':
+            config.num_connections = atoi(optarg);
+            if (config.num_connections <= 0 || config.num_connections > 10000) {
+                fprintf(stderr, "错误: 连接数必须在 1-10000 之间\n");
                 return 1;
+            }
+            break;
+        case 'r':
+            config.test_rounds = atoi(optarg);
+            if (config.test_rounds < 0) {
+                fprintf(stderr, "错误: 轮次必须 >= 0\n");
+                return 1;
+            }
+            break;
+        case 's':
+            config.send_size = atoi(optarg);
+            if (config.send_size <= 0 || config.send_size > 65536) {
+                fprintf(stderr, "错误: 数据大小必须在 1-65536 字节之间\n");
+                return 1;
+            }
+            break;
+        case 'q':
+            config.qps_limit = atoi(optarg);
+            if (config.qps_limit < 0) {
+                fprintf(stderr, "错误: QPS 限制必须 >= 0\n");
+                return 1;
+            }
+            break;
+        case 'd':
+            config.duration_sec = atoi(optarg);
+            if (config.duration_sec < 0) {
+                fprintf(stderr, "错误: 时长必须 >= 0\n");
+                return 1;
+            }
+            break;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        default:
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
@@ -240,10 +236,9 @@ int main(int argc, char *argv[]) {
     char log_filename[256];
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    snprintf(log_filename, sizeof(log_filename),
-             "test/logs/client_%04d%02d%02d_%02d%02d%02d.log",
-             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    snprintf(log_filename, sizeof(log_filename), "test/logs/client_%04d%02d%02d_%02d%02d%02d.log",
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday, tm_info->tm_hour, tm_info->tm_min,
+             tm_info->tm_sec);
 
     g_logger = logger_init(log_filename, LOG_INFO, 1, "client");
     if (!g_logger) {
@@ -298,8 +293,10 @@ int main(int argc, char *argv[]) {
             LOG_ERROR(g_logger, "缓冲区内存分配失败");
             // 清理
             for (int j = 0; j <= i; j++) {
-                if (conns[j].send_buf) free(conns[j].send_buf);
-                if (conns[j].recv_buf) free(conns[j].recv_buf);
+                if (conns[j].send_buf)
+                    free(conns[j].send_buf);
+                if (conns[j].recv_buf)
+                    free(conns[j].recv_buf);
             }
             free(conns);
             monitor_destroy(monitor);
@@ -348,9 +345,7 @@ int main(int argc, char *argv[]) {
     long long fail_count = 0;
 
     // 计算结束时间
-    long long end_time_target = (config.duration_sec > 0)
-        ? start_time + (config.duration_sec * 1000000LL)
-        : LLONG_MAX;
+    long long end_time_target = (config.duration_sec > 0) ? start_time + (config.duration_sec * 1000000LL) : LLONG_MAX;
 
     // QPS 限制相关
     long long sleep_interval_us = 0;
@@ -404,11 +399,10 @@ int main(int argc, char *argv[]) {
             double current_elapsed = (monitor_get_time_us() - start_time) / 1000000.0;
             double current_qps = success_count / current_elapsed;
             if (config.duration_sec > 0) {
-                LOG_INFO(g_logger, "[PROGRESS] 已运行 %.1f 秒, 当前 QPS: %.2f",
-                         current_elapsed, current_qps);
+                LOG_INFO(g_logger, "[PROGRESS] 已运行 %.1f 秒, 当前 QPS: %.2f", current_elapsed, current_qps);
             } else {
-                LOG_INFO(g_logger, "[PROGRESS] 已完成 %d/%d 轮, 当前 QPS: %.2f",
-                         round, config.test_rounds, current_qps);
+                LOG_INFO(g_logger, "[PROGRESS] 已完成 %d/%d 轮, 当前 QPS: %.2f", round, config.test_rounds,
+                         current_qps);
             }
         }
 
@@ -479,10 +473,8 @@ int main(int argc, char *argv[]) {
              stats_after.ctx_switches_voluntary - stats_before.ctx_switches_voluntary);
     LOG_INFO(g_logger, "非自愿上下文切换: %ld",
              stats_after.ctx_switches_involuntary - stats_before.ctx_switches_involuntary);
-    LOG_INFO(g_logger, "次要页面错误:     %ld",
-             stats_after.minor_page_faults - stats_before.minor_page_faults);
-    LOG_INFO(g_logger, "主要页面错误:     %ld",
-             stats_after.major_page_faults - stats_before.major_page_faults);
+    LOG_INFO(g_logger, "次要页面错误:     %ld", stats_after.minor_page_faults - stats_before.minor_page_faults);
+    LOG_INFO(g_logger, "主要页面错误:     %ld", stats_after.major_page_faults - stats_before.major_page_faults);
     LOG_INFO(g_logger, "========================================");
 
     // ========================================
@@ -511,10 +503,8 @@ int main(int argc, char *argv[]) {
            stats_after.ctx_switches_voluntary - stats_before.ctx_switches_voluntary);
     printf("    \"ctx_switches_involuntary\": %ld,\n",
            stats_after.ctx_switches_involuntary - stats_before.ctx_switches_involuntary);
-    printf("    \"page_faults_minor\": %ld,\n",
-           stats_after.minor_page_faults - stats_before.minor_page_faults);
-    printf("    \"page_faults_major\": %ld\n",
-           stats_after.major_page_faults - stats_before.major_page_faults);
+    printf("    \"page_faults_minor\": %ld,\n", stats_after.minor_page_faults - stats_before.minor_page_faults);
+    printf("    \"page_faults_major\": %ld\n", stats_after.major_page_faults - stats_before.major_page_faults);
     printf("  }\n");
     printf("}\n");
 
