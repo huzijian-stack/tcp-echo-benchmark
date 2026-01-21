@@ -1,0 +1,58 @@
+# ============================================
+# TCP Echo Benchmark .gitignore
+# ============================================
+
+# 编译产物
+/out/
+*.o
+*.so
+*.a
+*.bpf.o
+
+# 测试日志和临时文件
+/test/logs/
+/test/
+*.log
+/tmp/
+*.txt
+
+# 编辑器和 IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 调试文件
+core
+core.*
+vgcore.*
+*.dSYM/
+
+# 依赖和构建缓存
+.cache/
+*.d
+
+# Unix socket 文件
+*.sock
+/tmp/*.sock
+
+# 备份文件
+*.bak
+*.backup
+*.old
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# libbpf 临时目录
+/tmp/libbpf/
+
+# 性能分析文件
+perf.data
+perf.data.old
+*.prof
