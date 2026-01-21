@@ -27,6 +27,61 @@
 
 *测试环境：Ubuntu 20.04, Linux 5.15.0-139, gcc 9.4.0, clang 18*
 
+## 🧠 技术原理与架构
+
+本项目利用 eBPF Sockmap 技术实现了**内核旁路（Kernel Bypass）**数据转发。以下是传统模式与 eBPF 模式的流量路径对比：
+
+### 1. 传统 TCP Echo 流程
+
+在传统模式下，数据包必须经过完整的内核协议栈，并拷贝到用户空间进行处理，然后再拷贝回内核空间发送。
+
+```mermaid
+sequenceDiagram
+    participant NIC as 网卡
+    participant Kernel as Linux 内核栈
+    participant User as 用户态 Server
+
+    Note over NIC, User: 🐢 传统路径：2次拷贝 + 2次上下文切换
+    NIC->>Kernel: 1. 接收数据包 (RX)
+    Kernel->>Kernel: TCP 协议处理
+    Kernel->>User: 2. copy_to_user (read)
+    Note right of Kernel: ⚠️ 上下文切换 (Kernel -> User)
+    User->>User: 3. 业务逻辑 (Echo)
+    User->>Kernel: 4. copy_from_user (write)
+    Note left of User: ⚠️ 上下文切换 (User -> Kernel)
+    Kernel->>Kernel: TCP 协议处理
+    Kernel->>NIC: 5. 发送数据包 (TX)
+```
+
+### 2. eBPF Sockmap 流程
+
+本项目通过加载 sk_skb/stream_verdict BPF 程序，在内核网络栈的早期阶段拦截数据包，并直接重定向到发送队列。
+
+```mermaid
+sequenceDiagram
+    participant NIC as 网卡
+    participant Kernel as Linux 内核栈
+    participant BPF as eBPF 程序
+    participant User as 用户态 Server
+
+    Note over NIC, User: 🚀 eBPF 路径：0次拷贝 + 0次上下文切换
+    NIC->>Kernel: 1. 接收数据包 (RX)
+    Kernel->>BPF: 2. 触发 Stream Verdict
+    Note right of BPF: ⚡ 拦截点
+    BPF->>BPF: 3. 查找 Sockhash Map
+    BPF->>Kernel: 4. bpf_sk_redirect_hash (直接转发)
+    Note over BPF, Kernel: ↩️ 数据包直接进入发送队列 (Egress)
+    Kernel->>NIC: 5. 发送数据包 (TX)
+
+    Note right of User: 💤 用户态进程全程休眠
+```
+
+加速原理总结：
+
+- 零拷贝 (Zero Copy)：数据从未离开内核空间，仅在内核内部改变 Socket 指针指向，完全消除了 copy_to_user 和 copy_from_user。
+- 旁路用户态 (Bypass User Space)：数据包处理逻辑完全在内核软中断上下文（SoftIRQ）中完成，用户态 Server 进程无需被唤醒，CPU 消耗显著降低。
+- 缩短路径：跳过了文件系统层（VFS）、Socket 锁竞争等传统 I/O 操作的开销。
+
 ## 📁 项目结构
 
 ```
