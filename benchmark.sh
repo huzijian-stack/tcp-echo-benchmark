@@ -54,7 +54,6 @@ kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 sleep 1
 
-cleanup
 # 提取性能数据（跳过日志时间戳，排除 PROGRESS）
 BASELINE_QPS=$(grep "QPS:" /tmp/baseline.txt | grep -v PROGRESS | awk '{print $5}')
 BASELINE_LATENCY=$(grep "平均延迟:" /tmp/baseline.txt | awk '{print $5}')
@@ -66,6 +65,7 @@ echo "  平均延迟:    $BASELINE_LATENCY 微秒"
 echo "  CPU 使用率:  $BASELINE_CPU%"
 echo ""
 
+cleanup
 # ============================================
 # 测试 2: eBPF 加速版本
 # ============================================
@@ -96,6 +96,7 @@ echo "  平均延迟:    $EBPF_LATENCY 微秒"
 echo "  CPU 使用率:  $EBPF_CPU%"
 echo ""
 
+cleanup
 # ============================================
 # 性能对比
 # ============================================

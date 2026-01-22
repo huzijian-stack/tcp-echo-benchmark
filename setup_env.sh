@@ -77,6 +77,7 @@ install_basic_tools() {
         "net-tools"
         "wget"
         "curl"
+        "liburing-dev"
     )
 
     MISSING_PACKAGES=()
@@ -248,6 +249,16 @@ verify_environment() {
         log_success "clang: $CLANG_VERSION"
     else
         log_error "clang 未安装"
+    fi
+
+    # 检查 liburing
+    if pkg-config --exists liburing; then
+        LIBURING_VER=$(pkg-config --modversion liburing)
+        log_success "liburing: $LIBURING_VER"
+    elif dpkg -l | grep -q "liburing-dev"; then
+        log_success "liburing: 已安装 (dpkg)"
+    else
+        log_error "liburing 未安装 (io_uring 功能将无法编译)"
     fi
 
     # 检查 python3

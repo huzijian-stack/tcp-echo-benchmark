@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,14 +7,16 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include <sched.h>
+#include <liburing.h>
 
 // 引入日志和监控模块
 #include "logger.h"
@@ -23,516 +26,444 @@
 #include "sockmap_loader.h"
 #endif
 
-#define PORT 8888                                   // 监听端口
-#define MAX_EVENTS 1024                             // epoll 最大事件数
-#define BUFFER_SIZE 4096                            // 缓冲区大小
-#define BACKLOG 512                                 // listen 队列长度
-#define CONTROL_SOCKET "/tmp/tcp_echo_server.sock"  // 控制 socket 路径
+#define PORT 8888
+#define QUEUE_DEPTH 4096  // io_uring 队列深度
+#define BUFFER_SIZE 4096
+#define BACKLOG 4096
+#define CONTROL_SOCKET "/tmp/tcp_echo_server.sock"
 
-// 全局变量
-static volatile int running = 1;   // 运行标志
-static Logger *g_logger = NULL;    // 全局日志实例
-static Monitor *g_monitor = NULL;  // 全局监控实例
+// ==========================================
+// io_uring 上下文定义
+// ==========================================
+
+typedef enum { EVENT_ACCEPT, EVENT_READ, EVENT_WRITE } EventType;
+
+// 每个 I/O 操作的上下文
+typedef struct {
+    int fd;
+    EventType type;
+    char buffer[BUFFER_SIZE];
+    struct iovec iov;
+    struct msghdr msg;  // 用于 sendmsg/recvmsg (可选，这里用 readv/writev 简化)
+} IoContext;
+
+// ==========================================
+// 配置与统计结构
+// ==========================================
+
+static int g_worker_count = 0;
+
+typedef struct {
+    long long total_connections;
+    long long active_connections;
+    long long total_requests;
+    long long total_bytes_recv;
+    long long total_bytes_sent;
+    char padding[64];
+} __attribute__((aligned(64))) ThreadStats;
+
+typedef struct {
+    int thread_id;
+    struct io_uring ring;  // 每个线程一个 io_uring 实例
+    pthread_t thread_handle;
+    ThreadStats stats;
+} WorkerContext;
+
+static volatile int running = 1;
+static Logger *g_logger = NULL;
+static Monitor *g_monitor = NULL;
+static WorkerContext *g_workers = NULL;
+static long long g_start_time_us = 0;
 
 #ifdef ENABLE_EBPF
-static sockmap_loader_t *g_sockmap = NULL;  // eBPF Sockmap 加载器
+static sockmap_loader_t *g_sockmap = NULL;
 #define EBPF_OBJ_PATH "./out/ebpf/sockmap.bpf.o"
 #endif
 
-// 服务器统计信息
-typedef struct {
-    long long total_connections;   // 总连接数
-    long long active_connections;  // 当前活跃连接数
-    long long total_requests;      // 总请求数
-    long long total_bytes_recv;    // 总接收字节数
-    long long total_bytes_sent;    // 总发送字节数
-    long long start_time_us;       // 启动时间
-} ServerStats;
+// ==========================================
+// 工具函数
+// ==========================================
+int ensure_directory_exists(const char *path) {
+    char temp[256];
+    char *p = NULL;
+    snprintf(temp, sizeof(temp), "%s", path);
+    size_t len = strlen(temp);
+    if (temp[len - 1] == '/')
+        temp[len - 1] = 0;
+    for (p = temp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (mkdir(temp, S_IRWXU) != 0 && errno != EEXIST)
+                return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(temp, S_IRWXU) != 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
 
-static ServerStats g_stats = {0};  // 全局统计
-
-// 信号处理函数
 void signal_handler(int signum) {
-    LOG_INFO(g_logger, "收到信号 %d，正在关闭服务器...", signum);
+    if (g_logger)
+        LOG_INFO(g_logger, "收到信号 %d，正在关闭服务器...", signum);
     running = 0;
 }
 
-// 将文件描述符设置为非阻塞模式
-int set_nonblocking(int fd) {
+int set_reuseport(int fd) {
+    int opt = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+        return -1;
+    return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+}
+
+// ==========================================
+// io_uring 辅助函数
+// ==========================================
+
+// 准备 Accept 请求
+void add_accept_request(struct io_uring *ring, int server_fd, struct sockaddr *client_addr, socklen_t *client_len,
+                        IoContext *ctx) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    // 如果 SQ 满了，sqe 可能为 NULL，生产环境需要处理这种情况（通常是提交并重试）
+    if (!sqe)
+        return;
+
+    io_uring_prep_accept(sqe, server_fd, client_addr, client_len, 0);
+    ctx->fd = server_fd;
+    ctx->type = EVENT_ACCEPT;
+    io_uring_sqe_set_data(sqe, ctx);
+}
+
+// 准备 Read 请求
+void add_read_request(struct io_uring *ring, int client_fd, IoContext *ctx) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe)
+        return;
+
+    ctx->iov.iov_base = ctx->buffer;
+    ctx->iov.iov_len = BUFFER_SIZE;
+    ctx->fd = client_fd;
+    ctx->type = EVENT_READ;
+
+    io_uring_prep_readv(sqe, client_fd, &ctx->iov, 1, 0);
+    io_uring_sqe_set_data(sqe, ctx);
+}
+
+// 准备 Write 请求
+void add_write_request(struct io_uring *ring, int client_fd, IoContext *ctx, size_t len) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe)
+        return;
+
+    ctx->iov.iov_base = ctx->buffer;
+    ctx->iov.iov_len = len;
+    ctx->fd = client_fd;
+    ctx->type = EVENT_WRITE;
+
+    io_uring_prep_writev(sqe, client_fd, &ctx->iov, 1, 0);
+    io_uring_sqe_set_data(sqe, ctx);
+}
+
+// ==========================================
+// Socket 创建
+// ==========================================
+int create_listener() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    if (set_reuseport(fd) < 0) {
+        close(fd);
+        return -1;
+    }
+
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        if (g_logger) {
-            LOG_ERROR(g_logger, "fcntl F_GETFL 失败: %s", strerror(errno));
-        }
-        return -1;
-    }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        if (g_logger) {
-            LOG_ERROR(g_logger, "fcntl F_SETFL 失败: %s", strerror(errno));
-        }
-        return -1;
-    }
-    return 0;
-}
-
-// 设置 SO_REUSEADDR
-int set_reuseaddr(int fd) {
-    int opt = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        if (g_logger) {
-            LOG_ERROR(g_logger, "setsockopt SO_REUSEADDR 失败: %s", strerror(errno));
-        }
-        return -1;
-    }
-    return 0;
-}
-
-// 设置 TCP_NODELAY
-int set_nodelay(int fd) {
-    int opt = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
-        if (g_logger) {
-            LOG_ERROR(g_logger, "setsockopt TCP_NODELAY 失败: %s", strerror(errno));
-        }
-        return -1;
-    }
-    return 0;
-}
-
-// 创建、绑定 listening socket
-int create_and_bind() {
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        LOG_ERROR(g_logger, "socket 创建失败: %s", strerror(errno));
-        return -1;
-    }
-
-    if (set_reuseaddr(listen_fd) < 0) {
-        close(listen_fd);
-        return -1;
-    }
-
-    if (set_nonblocking(listen_fd) < 0) {
-        close(listen_fd);
-        return -1;
-    }
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(PORT);
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR(g_logger, "bind 失败: %s", strerror(errno));
-        close(listen_fd);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
         return -1;
     }
 
-    return listen_fd;
-}
-
-// 处理新连接
-int handle_accept(int listen_fd, int epoll_fd) {
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-
-        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            } else {
-                LOG_ERROR(g_logger, "accept 失败: %s", strerror(errno));
-                return -1;
-            }
-        }
-
-        if (set_nonblocking(client_fd) < 0) {
-            close(client_fd);
-            continue;
-        }
-
-        if (set_nodelay(client_fd) < 0) {
-            close(client_fd);
-            continue;
-        }
-
-        struct epoll_event event;
-        event.data.fd = client_fd;
-        event.events = EPOLLIN | EPOLLET;
-
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
-            LOG_ERROR(g_logger, "epoll_ctl 失败: %s", strerror(errno));
-            close(client_fd);
-            continue;
-        }
-
-        g_stats.total_connections++;
-        g_stats.active_connections++;
-
-#ifdef ENABLE_EBPF
-        // 将 socket 添加到 sockmap
-        if (g_sockmap) {
-            if (sockmap_loader_add_socket(g_sockmap, client_fd) < 0) {
-                LOG_WARN(g_logger, "Failed to add socket %d to sockmap", client_fd);
-            } else {
-                LOG_DEBUG(g_logger, "Socket %d added to sockmap", client_fd);
-            }
-        }
-#endif
-
-        LOG_DEBUG(g_logger, "接受新连接：fd=%d (总连接=%lld, 活跃=%lld)", client_fd, g_stats.total_connections,
-                  g_stats.active_connections);
+    if (listen(fd, BACKLOG) < 0) {
+        close(fd);
+        return -1;
     }
-    return 0;
+    return fd;
 }
 
-// 处理客户端数据（Echo 逻辑）
-int handle_read(int client_fd) {
-    char buffer[BUFFER_SIZE];
-    ssize_t total_read = 0;
+// ==========================================
+// 工作线程 (Worker) - io_uring 核心循环
+// ==========================================
+void *worker_routine(void *arg) {
+    WorkerContext *ctx = (WorkerContext *)arg;
+    int thread_id = ctx->thread_id;
 
-    while (1) {
-        ssize_t n = read(client_fd, buffer, sizeof(buffer));
+    // 1. CPU 亲和性
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    int cpu_count = monitor_get_cpu_count();
+    int cpu_id = thread_id % cpu_count;
+    CPU_SET(cpu_id, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    LOG_INFO(g_logger, "[Worker %d] 绑定 CPU %d", thread_id, cpu_id);
 
-        if (n > 0) {
-            total_read += n;
-            g_stats.total_bytes_recv += n;
-            g_stats.total_requests++;
-
-            ssize_t written = 0;
-            while (written < n) {
-                ssize_t w = write(client_fd, buffer + written, n - written);
-                if (w < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        continue;
-                    }
-                    LOG_ERROR(g_logger, "write 失败: %s", strerror(errno));
-                    return -1;
-                }
-                written += w;
-                g_stats.total_bytes_sent += w;
-            }
-        } else if (n == 0) {
-            LOG_DEBUG(g_logger, "客户端关闭连接：fd=%d", client_fd);
-            g_stats.active_connections--;
-#ifdef ENABLE_EBPF
-            // 从 sockmap 移除 socket
-            if (g_sockmap) {
-                sockmap_loader_remove_socket(g_sockmap, client_fd);
-            }
-#endif
-            return -1;
-        } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            } else {
-                LOG_ERROR(g_logger, "read 失败: %s", strerror(errno));
-                g_stats.active_connections--;
-#ifdef ENABLE_EBPF
-                // 从 sockmap 移除 socket
-                if (g_sockmap) {
-                    sockmap_loader_remove_socket(g_sockmap, client_fd);
-                }
-#endif
-                return -1;
-            }
-        }
-    }
-
-    return 0;
-}
-
-// 控制接口处理函数
-void *control_thread(void *arg) {
-    (void)arg;
-
-    // 删除旧的 socket 文件
-    unlink(CONTROL_SOCKET);
-
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) {
-        LOG_ERROR(g_logger, "控制 socket 创建失败: %s", strerror(errno));
+    // 2. 初始化 io_uring
+    if (io_uring_queue_init(QUEUE_DEPTH, &ctx->ring, 0) < 0) {
+        LOG_ERROR(g_logger, "[Worker %d] io_uring_queue_init 失败", thread_id);
         return NULL;
     }
 
+    // 3. 创建监听 Socket
+    int listen_fd = create_listener();
+    if (listen_fd < 0) {
+        LOG_ERROR(g_logger, "[Worker %d] 创建监听 Socket 失败: %s", thread_id, strerror(errno));
+        return NULL;
+    }
+
+    // 4. 提交第一个 Accept 请求
+    IoContext *listener_ctx = malloc(sizeof(IoContext));
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    add_accept_request(&ctx->ring, listen_fd, (struct sockaddr *)&client_addr, &client_len, listener_ctx);
+    io_uring_submit(&ctx->ring);
+
+    struct io_uring_cqe *cqe;
+
+    // 5. 事件循环
+    while (running) {
+        struct __kernel_timespec ts;
+        ts.tv_sec = 1;
+        ts.tv_nsec = 0;
+
+        int ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, &ts);
+
+        if (ret == -ETIME) {
+            continue;
+        }
+
+        if (ret < 0) {
+            if (ret == -EINTR)
+                continue;
+            LOG_ERROR(g_logger, "[Worker %d] io_uring_wait_cqe 错误: %d", thread_id, ret);
+            break;
+        }
+
+        unsigned head;
+        int count = 0;
+
+        io_uring_for_each_cqe(&ctx->ring, head, cqe) {
+            count++;
+            IoContext *req_ctx = (IoContext *)io_uring_cqe_get_data(cqe);
+            int res = cqe->res;
+
+            if (res < 0 && res != -EAGAIN) {
+                if (req_ctx->type != EVENT_ACCEPT) {
+                    close(req_ctx->fd);
+                    free(req_ctx);
+                    ctx->stats.active_connections--;
+                }
+            } else {
+                switch (req_ctx->type) {
+                case EVENT_ACCEPT: {
+                    int client_fd = res;
+                    if (client_fd >= 0) {
+                        ctx->stats.total_connections++;
+                        ctx->stats.active_connections++;
+                        IoContext *client_ctx = malloc(sizeof(IoContext));
+                        if (client_ctx) {
+                            add_read_request(&ctx->ring, client_fd, client_ctx);
+#ifdef ENABLE_EBPF
+                            if (g_sockmap)
+                                sockmap_loader_add_socket(g_sockmap, client_fd);
+#endif
+                        } else {
+                            close(client_fd);
+                        }
+                    }
+                    client_len = sizeof(client_addr);
+                    add_accept_request(&ctx->ring, listen_fd, (struct sockaddr *)&client_addr, &client_len,
+                                       listener_ctx);
+                    break;
+                }
+                case EVENT_READ: {
+                    int bytes_read = res;
+                    if (bytes_read <= 0) {
+                        close(req_ctx->fd);
+#ifdef ENABLE_EBPF
+                        if (g_sockmap)
+                            sockmap_loader_remove_socket(g_sockmap, req_ctx->fd);
+#endif
+                        free(req_ctx);
+                        ctx->stats.active_connections--;
+                    } else {
+                        ctx->stats.total_bytes_recv += bytes_read;
+                        ctx->stats.total_requests++;
+                        add_write_request(&ctx->ring, req_ctx->fd, req_ctx, bytes_read);
+                    }
+                    break;
+                }
+                case EVENT_WRITE: {
+                    int bytes_written = res;
+                    if (bytes_written > 0) {
+                        ctx->stats.total_bytes_sent += bytes_written;
+                    }
+                    add_read_request(&ctx->ring, req_ctx->fd, req_ctx);
+                    break;
+                }
+                }
+            }
+        }
+
+        io_uring_cq_advance(&ctx->ring, count);
+        io_uring_submit(&ctx->ring);
+    }
+
+    free(listener_ctx);
+    close(listen_fd);
+    io_uring_queue_exit(&ctx->ring);
+    return NULL;
+}
+
+// ==========================================
+// 控制线程
+// ==========================================
+void *control_thread(void *arg) {
+    (void)arg;
+    unlink(CONTROL_SOCKET);
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, CONTROL_SOCKET, sizeof(addr.sun_path) - 1);
 
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR(g_logger, "控制 socket bind 失败: %s", strerror(errno));
-        close(sock);
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
         return NULL;
-    }
-
-    if (listen(sock, 5) < 0) {
-        LOG_ERROR(g_logger, "控制 socket listen 失败: %s", strerror(errno));
-        close(sock);
-        return NULL;
-    }
-
-    LOG_INFO(g_logger, "控制接口启动: %s", CONTROL_SOCKET);
+    listen(sock, 5);
 
     while (running) {
         int client = accept(sock, NULL, NULL);
-        if (client < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
+        if (client < 0)
+            continue;
 
         char cmd[256] = {0};
-        ssize_t n = read(client, cmd, sizeof(cmd) - 1);
-        if (n <= 0) {
-            close(client);
-            continue;
-        }
+        if (read(client, cmd, sizeof(cmd) - 1) > 0) {
+            cmd[strcspn(cmd, "\r\n")] = 0;
+            char response[4096];
 
-        // 移除换行符
-        cmd[strcspn(cmd, "\r\n")] = 0;
+            if (strcmp(cmd, "stats") == 0) {
+                long long total_conn = 0, active_conn = 0, total_req = 0, rx = 0, tx = 0;
+                for (int i = 0; i < g_worker_count; i++) {
+                    total_conn += g_workers[i].stats.total_connections;
+                    active_conn += g_workers[i].stats.active_connections;
+                    total_req += g_workers[i].stats.total_requests;
+                    rx += g_workers[i].stats.total_bytes_recv;
+                    tx += g_workers[i].stats.total_bytes_sent;
+                }
 
-        LOG_INFO(g_logger, "收到控制命令: %s", cmd);
+                SystemStats sys_stats;
+                monitor_collect(g_monitor, &sys_stats);
+                long long uptime = (monitor_get_time_us() - g_start_time_us) / 1000000;
 
-        char response[4096];
-        if (strcmp(cmd, "stats") == 0) {
-            // 获取当前系统状态
-            SystemStats sys_stats;
-            monitor_collect(g_monitor, &sys_stats);
-
-            long long uptime_sec = (monitor_get_time_us() - g_stats.start_time_us) / 1000000;
-
-            snprintf(response, sizeof(response),
-                     "{\n"
-                     "  \"status\": \"running\",\n"
-                     "  \"uptime_sec\": %lld,\n"
-                     "  \"connections\": {\n"
-                     "    \"total\": %lld,\n"
-                     "    \"active\": %lld\n"
-                     "  },\n"
-                     "  \"traffic\": {\n"
-                     "    \"total_requests\": %lld,\n"
-                     "    \"bytes_recv\": %lld,\n"
-                     "    \"bytes_sent\": %lld\n"
-                     "  },\n"
-                     "  \"system\": {\n"
-                     "    \"cpu_percent\": %.2f,\n"
-                     "    \"memory_rss_mb\": %.2f,\n"
-                     "    \"threads\": %ld\n"
-                     "  }\n"
-                     "}\n",
-                     uptime_sec, g_stats.total_connections, g_stats.active_connections, g_stats.total_requests,
-                     g_stats.total_bytes_recv, g_stats.total_bytes_sent, sys_stats.cpu_usage_percent,
-                     sys_stats.memory_rss_kb / 1024.0, sys_stats.num_threads);
-        } else if (strcmp(cmd, "shutdown") == 0) {
-            snprintf(response, sizeof(response), "{\"status\": \"shutting_down\"}\n");
+                snprintf(response, sizeof(response),
+                         "{\"status\":\"running\",\"mode\":\"io_uring\",\"uptime\":%lld,"
+                         "\"connections\":{\"total\":%lld,\"active\":%lld},"
+                         "\"traffic\":{\"requests\":%lld,\"rx\":%lld,\"tx\":%lld},"
+                         "\"system\":{\"cpu\":%.2f,\"mem_mb\":%.2f,\"threads\":%d}}\n",
+                         uptime, total_conn, active_conn, total_req, rx, tx, sys_stats.cpu_usage_percent,
+                         sys_stats.memory_rss_kb / 1024.0, g_worker_count);
+            } else if (strcmp(cmd, "shutdown") == 0) {
+                snprintf(response, sizeof(response), "{\"status\":\"shutting_down\"}\n");
+                write(client, response, strlen(response));
+                running = 0;
+                break;
+            } else {
+                snprintf(response, sizeof(response), "{\"error\":\"unknown_command\"}\n");
+            }
             write(client, response, strlen(response));
-            close(client);
-            running = 0;
-            break;
-        } else {
-            snprintf(response, sizeof(response), "{\"error\": \"unknown_command\", \"cmd\": \"%s\"}\n", cmd);
         }
-
-        write(client, response, strlen(response));
         close(client);
     }
-
     close(sock);
     unlink(CONTROL_SOCKET);
     return NULL;
 }
 
-int main() {
-    // 初始化日志系统
+// ==========================================
+// 主函数
+// ==========================================
+int main(int argc, char *argv[]) {
+    const char *log_dir = "test/logs";
+    if (ensure_directory_exists(log_dir) != 0) {
+        fprintf(stderr, "无法创建日志目录 %s: %s\n", log_dir, strerror(errno));
+        return 1;
+    }
+
     char log_filename[256];
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    snprintf(log_filename, sizeof(log_filename), "test/logs/server_%04d%02d%02d_%02d%02d%02d.log",
+    snprintf(log_filename, sizeof(log_filename), "%s/server_uring_%04d%02d%02d_%02d%02d%02d.log", log_dir,
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday, tm_info->tm_hour, tm_info->tm_min,
              tm_info->tm_sec);
 
     g_logger = logger_init(log_filename, LOG_INFO, 1, "server");
-    if (!g_logger) {
-        fprintf(stderr, "Failed to initialize logger\n");
+    if (!g_logger)
         return 1;
-    }
 
-    // 初始化监控
     g_monitor = monitor_init();
-    if (!g_monitor) {
-        LOG_ERROR(g_logger, "Failed to initialize monitor");
-        logger_close(g_logger);
-        return 1;
-    }
+    g_start_time_us = monitor_get_time_us();
 
-    LOG_INFO(g_logger, "========================================");
-    LOG_INFO(g_logger, "    高性能 Epoll Echo Server");
-    LOG_INFO(g_logger, "========================================");
-    LOG_INFO(g_logger, "端口: %d", PORT);
-    LOG_INFO(g_logger, "最大事件数: %d", MAX_EVENTS);
-    LOG_INFO(g_logger, "缓冲区大小: %d 字节", BUFFER_SIZE);
-    LOG_INFO(g_logger, "日志文件: %s", log_filename);
-#ifdef ENABLE_EBPF
-    LOG_INFO(g_logger, "eBPF Sockmap: 已启用");
-#else
-    LOG_INFO(g_logger, "eBPF Sockmap: 未启用");
-#endif
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
 
-    // 注册信号处理
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);  // 忽略 SIGPIPE
+    int num_cpus = monitor_get_cpu_count();
+    if (argc > 1)
+        g_worker_count = atoi(argv[1]);
+    if (g_worker_count <= 0)
+        g_worker_count = num_cpus;
 
-    // 创建并绑定 listening socket
-    int listen_fd = create_and_bind();
-    if (listen_fd < 0) {
-        monitor_destroy(g_monitor);
-        logger_close(g_logger);
-        return 1;
-    }
-
-    if (listen(listen_fd, BACKLOG) < 0) {
-        LOG_ERROR(g_logger, "listen 失败: %s", strerror(errno));
-        close(listen_fd);
-        monitor_destroy(g_monitor);
-        logger_close(g_logger);
-        return 1;
-    }
-
-    LOG_INFO(g_logger, "服务器监听在 127.0.0.1:%d", PORT);
-
-    // 创建 epoll 实例
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        LOG_ERROR(g_logger, "epoll_create1 失败: %s", strerror(errno));
-        close(listen_fd);
-        monitor_destroy(g_monitor);
-        logger_close(g_logger);
-        return 1;
-    }
-
-    // 把 listening socket 加入 epoll
-    struct epoll_event event;
-    event.data.fd = listen_fd;
-    event.events = EPOLLIN | EPOLLET;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) < 0) {
-        LOG_ERROR(g_logger, "epoll_ctl 失败: %s", strerror(errno));
-        close(listen_fd);
-        close(epoll_fd);
-        monitor_destroy(g_monitor);
-        logger_close(g_logger);
-        return 1;
-    }
-
-    // 启动控制线程
-    pthread_t ctrl_thread;
-    if (pthread_create(&ctrl_thread, NULL, control_thread, NULL) != 0) {
-        LOG_ERROR(g_logger, "创建控制线程失败: %s", strerror(errno));
-    } else {
-        pthread_detach(ctrl_thread);
-    }
-
-    // 记录启动时间
-    g_stats.start_time_us = monitor_get_time_us();
+    LOG_INFO(g_logger, "启动 io_uring 服务器 | CPU: %d | Workers: %d | Port: %d", num_cpus, g_worker_count, PORT);
 
 #ifdef ENABLE_EBPF
-    // 初始化 eBPF Sockmap
-    LOG_INFO(g_logger, "正在加载 eBPF Sockmap...");
     g_sockmap = sockmap_loader_init(EBPF_OBJ_PATH);
-    if (!g_sockmap) {
-        LOG_ERROR(g_logger, "Failed to initialize eBPF sockmap");
-        LOG_WARN(g_logger, "将使用传统方式运行（无 eBPF 加速）");
-    } else {
+    if (g_sockmap)
         LOG_INFO(g_logger, "eBPF Sockmap 加载成功");
-    }
 #endif
 
-    struct epoll_event events[MAX_EVENTS];
-    LOG_INFO(g_logger, "Epoll 循环启动");
-
-    // 事件循环
-    while (running) {
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
-
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            LOG_ERROR(g_logger, "epoll_wait 失败: %s", strerror(errno));
-            break;
-        }
-
-        for (int i = 0; i < n; i++) {
-            if (events[i].data.fd == listen_fd) {
-                if (handle_accept(listen_fd, epoll_fd) < 0) {
-                    LOG_ERROR(g_logger, "accept 失败");
-                }
-            } else {
-                if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN))) {
-                    close(events[i].data.fd);
-                    g_stats.active_connections--;
-                    continue;
-                }
-
-                if (handle_read(events[i].data.fd) < 0) {
-                    close(events[i].data.fd);
-                }
-            }
+    g_workers = calloc(g_worker_count, sizeof(WorkerContext));
+    for (int i = 0; i < g_worker_count; i++) {
+        g_workers[i].thread_id = i;
+        if (pthread_create(&g_workers[i].thread_handle, NULL, worker_routine, &g_workers[i]) != 0) {
+            LOG_ERROR(g_logger, "无法创建线程 %d", i);
+            exit(1);
         }
     }
 
-    // 清理
-    LOG_INFO(g_logger, "");
-    LOG_INFO(g_logger, "========================================");
-    LOG_INFO(g_logger, "         服务器统计");
-    LOG_INFO(g_logger, "========================================");
-    LOG_INFO(g_logger, "总连接数:         %lld", g_stats.total_connections);
-    LOG_INFO(g_logger, "总请求数:         %lld", g_stats.total_requests);
-    LOG_INFO(g_logger, "总接收字节:       %lld", g_stats.total_bytes_recv);
-    LOG_INFO(g_logger, "总发送字节:       %lld", g_stats.total_bytes_sent);
+    pthread_t ctrl_thread_id;
+    pthread_create(&ctrl_thread_id, NULL, control_thread, NULL);
+    pthread_detach(ctrl_thread_id);
 
-#ifdef ENABLE_EBPF
-    // 打印 eBPF 统计信息
-    if (g_sockmap) {
-        unsigned long long redirected = 0, redirect_err = 0, parsed = 0, parse_err = 0;
-        sockmap_loader_get_stats(g_sockmap, &redirected, &redirect_err, &parsed, &parse_err);
-        LOG_INFO(g_logger, "----------------------------------------");
-        LOG_INFO(g_logger, "eBPF Sockmap 统计:");
-        LOG_INFO(g_logger, "  重定向成功:     %llu", redirected);
-        LOG_INFO(g_logger, "  重定向失败:     %llu", redirect_err);
-        LOG_INFO(g_logger, "  解析成功:       %llu", parsed);
-        LOG_INFO(g_logger, "  解析失败:       %llu", parse_err);
-        if (redirected + redirect_err > 0) {
-            double success_rate = (redirected * 100.0) / (redirected + redirect_err);
-            LOG_INFO(g_logger, "  重定向成功率:   %.2f%%", success_rate);
-        }
+    for (int i = 0; i < g_worker_count; i++) {
+        pthread_join(g_workers[i].thread_handle, NULL);
     }
-#endif
-
-    // 获取最终系统状态
-    SystemStats final_stats;
-    monitor_collect(g_monitor, &final_stats);
-    LOG_INFO(g_logger, "----------------------------------------");
-    LOG_INFO(g_logger, "最终 CPU 使用率:  %.2f%%", final_stats.cpu_usage_percent);
-    LOG_INFO(g_logger, "最终 RSS 内存:    %.2f MB", final_stats.memory_rss_kb / 1024.0);
-    LOG_INFO(g_logger, "========================================");
 
 #ifdef ENABLE_EBPF
-    // 清理 eBPF 资源
-    if (g_sockmap) {
+    if (g_sockmap)
         sockmap_loader_destroy(g_sockmap);
-        LOG_INFO(g_logger, "eBPF Sockmap 已清理");
-    }
 #endif
-
-    close(listen_fd);
-    close(epoll_fd);
+    free(g_workers);
     monitor_destroy(g_monitor);
     logger_close(g_logger);
-
     return 0;
 }
